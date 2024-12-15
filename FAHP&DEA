@@ -1,0 +1,341 @@
+import pandas as pd
+import numpy as np
+import glob
+import os
+import tkinter as tk
+from tkinter import messagebox
+from scipy.optimize import minimize
+
+'''
+15-12-2024
+很多问题待解决：1. AHP和DEA的报错文字目前还是一样的，需要根据不同的结果给出不同的报错理由
+2. 结果覆写原数据，应该根据输入文档的名字格式改写输出(新)文档的名字
+3. 需要根据原论文检查DEA输入数据的格式和DEA结果的解读办法
+4. DEA数据是否也涉及到分权问题？是否可以将更多数据并入DEA的参考？
+'''
+
+class DEA(object):
+    def __init__(self, inputs, outputs):
+        # supplied data
+        self.inputs = inputs
+        self.outputs = outputs
+
+        # parameters
+        self.n = inputs.shape[0]
+        self.m = inputs.shape[1]
+        self.r = outputs.shape[1]
+
+        # iterators
+        self.unit_ = range(self.n)
+        self.input_ = range(self.m)
+        self.output_ = range(self.r)
+
+        # result arrays
+        self.output_w = np.zeros((self.r, 1), dtype=np.float64)
+        self.input_w = np.zeros((self.m, 1), dtype=np.float64)
+        self.lambdas = np.zeros((self.n, 1), dtype=np.float64)
+        self.efficiency = np.zeros_like(self.lambdas)
+
+    def __efficiency(self, unit):
+        denominator = np.dot(self.inputs, self.input_w)
+        numerator = np.dot(self.outputs, self.output_w)
+        return (numerator / denominator)[unit]
+
+    def __target(self, x, unit):
+        in_w, out_w, lambdas = x[:self.m], x[self.m:(self.m+self.r)], x[(self.m+self.r):]
+        denominator = np.dot(self.inputs[unit], in_w)
+        numerator = np.dot(self.outputs[unit], out_w)
+        return numerator / denominator
+
+    def __constraints(self, x, unit):
+        in_w, out_w, lambdas = x[:self.m], x[self.m:(self.m+self.r)], x[(self.m+self.r):]
+        constr = []
+        t = self.__target(x, unit)
+
+        # 对输入约束
+        for input_i in self.input_:
+            lhs = np.dot(self.inputs[:, input_i], lambdas)
+            cons = t * self.inputs[unit, input_i] - lhs
+            constr.append(cons)
+
+        # 对输出约束
+        for output_i in self.output_:
+            lhs = np.dot(self.outputs[:, output_i], lambdas)
+            cons = lhs - self.outputs[unit, output_i]
+            constr.append(cons)
+
+        # lambdas >= 0
+        for u in self.unit_:
+            constr.append(lambdas[u])
+
+        return np.array(constr)
+
+    def __optimize(self):
+        d0 = self.m + self.r + self.n
+        for unit in self.unit_:
+            x0 = np.random.rand(d0) - 0.5
+            # 构造SLSQP约束列表
+            constr_values = self.__constraints(x0, unit)
+            constraints_list = []
+            for i in range(len(constr_values)):
+                constraints_list.append({
+                    'type': 'ineq',
+                    'fun': lambda x, idx=i: self.__constraints(x, unit)[idx]
+                })
+
+            res = minimize(self.__target, x0, args=(unit,),
+                           method='SLSQP', constraints=constraints_list)
+
+            self.input_w = res.x[:self.m].reshape(-1,1)
+            self.output_w = res.x[self.m:(self.m+self.r)].reshape(-1,1)
+            self.lambdas = res.x[(self.m+self.r):].reshape(-1,1)
+            self.efficiency[unit] = self.__efficiency(unit)
+
+    def fit(self):
+        self.__optimize()
+        return self.efficiency
+
+
+def fuzzy_ahp_method(dataset):
+    row_sum = []
+    s_row = []
+    f_w = []
+    d_w = []
+    inc_rat = np.array([0, 0, 0, 0.58, 0.9, 1.12, 1.24, 1.32, 1.41, 1.45, 1.49, 1.51, 1.48, 1.56, 1.57, 1.59])
+    X = [(item[0] + 4 * item[1] + item[2]) / 6 for i in range(len(dataset)) for item in dataset[i]]
+    X = np.asarray(X)
+    X = np.reshape(X, (len(dataset), len(dataset)))
+
+    for i in range(len(dataset)):
+        a, b, c = 1, 1, 1
+        for j in range(len(dataset[i])):
+            d, e, f = dataset[i][j]
+            a, b, c = a * d, b * e, c * f
+        row_sum.append((a, b, c))
+    L, M, U = 0, 0, 0
+    for i in range(len(row_sum)):
+        a, b, c = row_sum[i]
+        a, b, c = a ** (1 / len(dataset)), b ** (1 / len(dataset)), c ** (1 / len(dataset))
+        s_row.append((a, b, c))
+        L += a
+        M += b
+        U += c
+
+    for i in range(len(s_row)):
+        a, b, c = s_row[i]
+        a, b, c = a / U, b / M, c / L
+        f_w.append((a, b, c))
+        d_w.append((a + b + c) / 3)
+
+    n_w = [item / sum(d_w) for item in d_w]
+    vector = np.sum(X * n_w, axis=1) / n_w
+    lamb_max = np.mean(vector)
+    cons_ind = (lamb_max - X.shape[1]) / (X.shape[1] - 1)
+    rc = cons_ind / inc_rat[X.shape[1]]
+    return f_w, d_w, n_w, rc
+
+
+def validate_data_and_get_dataset(selected_file):
+    # 返回: (成功标志, n, dataset或错误信息, numeric_df)
+    # 如果数据有效则返回 (True, n, dataset, numeric_df)
+    # 如果无效返回 (False, None, "错误信息", None)
+    try:
+        df = pd.read_excel(selected_file, sheet_name=0, header=None)
+    except Exception as e:
+        return False, None, f"无法读取文件 {selected_file}：{e}", None, None
+
+    sub_df = df.iloc[1:, 1:]
+
+    def parse_value(v):
+        # 将范围改为接受1/9～9之间的值（包含分数形式，如1/3, 1/9）
+        # AHP标准刻度为 {1/9,1/8,...,1,2,...9}，即从约0.111...到9
+        min_val = 1/9
+        min_val = 1/9
+        max_val = 9
+        if pd.isna(v):
+            return np.nan
+        if isinstance(v, (int, float)):
+            return v if (min_val <= v <= max_val) else np.nan
+        if isinstance(v, str):
+            v = v.strip()
+            if "/" in v:
+                parts = v.split("/")
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    numerator = int(parts[0])
+                    denominator = int(parts[1])
+                    if denominator == 0:
+                        return np.nan
+                    val = numerator / denominator
+                    return val if (min_val <= val <= max_val) else np.nan
+            # 尝试将字符串转为float
+            try:
+                val = float(v)
+                return val if (min_val <= val <= max_val) else np.nan
+            except:
+                return np.nan
+        return np.nan
+    # 对sub_df每个值进行解析
+    numeric_df = sub_df.applymap(parse_value)
+    numeric_df = numeric_df.dropna(how='all', axis=0).dropna(how='all', axis=1)
+
+    if numeric_df.empty:
+        return False, None, ("无法在sheet1找到数据，请检查数据是否已正确填写。\n"
+                            "要求：第一行第一列为描述文字，其余单元格为1/9至9的整数或分数(如1/3)。"), None, df
+    # 检查是否存在NaN值，若有则说明存在不符合要求的数据
+    if numeric_df.isna().any().any():
+        return False, None, ("sheet1中存在非1/9至9的值或无法识别的文本。\n"
+                            "请确保数据为1/9至9之间的整数或分数(如1/3)。"), None, df
+
+    valid_rows = 0
+    for i in range(numeric_df.shape[0]):
+        row_data = numeric_df.iloc[i].dropna()
+        if len(row_data) > 0:
+            valid_rows += 1
+        else:
+            break
+
+    valid_cols = 0
+    for j in range(numeric_df.shape[1]):
+        col_data = numeric_df.iloc[:, j].dropna()
+        if len(col_data) > 0:
+            valid_cols += 1
+        else:
+            break
+
+    n = min(valid_rows, valid_cols)
+    if n < 2 or n > 10:
+        return False, None, f"有效指标数(n={n})不在预期范围(2~10)。请确保矩阵为2x2至10x10。", None, df
+
+    dataset = []
+    for i in range(n):
+        row_data = []
+        for j in range(n):
+            val = float(numeric_df.iat[i, j])
+            l = m = u = val
+            row_data.append((l, m, u))
+        dataset.append(row_data)
+
+    return True, n, dataset, numeric_df, df
+
+
+def process_ahp(selected_file):
+    success, n, dataset, numeric_df, df_original = validate_data_and_get_dataset(selected_file)
+    if not success:
+        messagebox.showerror("错误", dataset)  # dataset中为错误信息
+        return
+
+    fuzzy_weights, defuzzified_weights, normalized_weights, rc = fuzzy_ahp_method(dataset)
+
+    if rc > 0.10:
+        messagebox.showerror("数据不一致", f"RC值为{round(rc, 2)} > 0.1，无法得到有效权重。\n"
+                                   "可能原因：\n"
+                                   "1. 数据填写不严谨，判断矩阵不一致。\n"
+                                   "2. 部分数据输入错误导致矩阵对比关系不合理。\n\n"
+                                   "请检查并修正Excel数据后再试。")
+        return
+
+    normalized_weights = [round(x, 2) for x in normalized_weights]
+
+    # 使用原始excel第一列(跳过第一行描述)作为指标名
+    text_labels = df_original.iloc[1:1+n, 0].values
+
+    result_data = {
+        "指标": text_labels,
+        "对应权重": normalized_weights
+    }
+    df_result = pd.DataFrame(result_data)
+
+    base_name = os.path.splitext(os.path.basename(selected_file))[0]
+    # 确保不会覆盖原文件中的数据
+    weight_file = base_name.replace("原始主观排序", "权重") + ".xlsx"
+    df_result.to_excel(weight_file, index=False)
+    messagebox.showinfo("完成", f"已保存结果到 {weight_file}")
+
+
+def process_dea(selected_file):
+    success, n, dataset, numeric_df, df_original = validate_data_and_get_dataset(selected_file)
+    if not success:
+        messagebox.showerror("错误", dataset)  # dataset中为错误信息
+        return
+
+    # 假设：DEA输入为除最后一列外的所有列，输出为最后一列
+    if numeric_df.shape[1] < 2:
+        messagebox.showerror("错误", "DEA计算需要至少1列输入和1列输出，请检查数据列数。")
+        return
+
+    X = numeric_df.iloc[:, :-1].values
+    y = numeric_df.iloc[:, -1:].values
+
+    dea = DEA(X, y)
+    rs = dea.fit()
+
+    rs_rounded = [round(float(x), 2) for x in rs]
+
+    # 输出DEA结果
+    result_data = {
+        "DMU": ["DMU" + str(i + 1) for i in range(len(rs_rounded))],
+        "效率": rs_rounded
+    }
+    df_result = pd.DataFrame(result_data)
+
+    base_name = os.path.splitext(os.path.basename(selected_file))[0]
+    dea_file = base_name.replace("DEA主观排序", "DEA结果") + ".xlsx"
+    df_result.to_excel(dea_file, index=False)
+    messagebox.showinfo("完成", f"已保存DEA结果到 {dea_file}")
+
+
+def main():
+    ahp_files = glob.glob("AHP主观排序*.xlsx")
+    dea_files = glob.glob("DEA主观排序*.xlsx")
+
+    if not ahp_files:
+        print("未找到任何匹配的 'AHP主观排序*.xlsx' 文件。")
+        return
+    
+    if not dea_files:
+        print("未找到任何匹配的 'DEA主观排序*.xlsx' 文件。")
+        return
+
+    root = tk.Tk()
+    root.title("文件处理工具")
+
+    tk.Label(root, text="请选择要处理的文件：").pack(pady=5)
+    listbox = tk.Listbox(root, width=50, height=10)
+    listbox.pack(pady=5)
+
+    for f in ahp_files:
+        listbox.insert(tk.END, f)
+
+    for f in dea_files:
+        listbox.insert(tk.END, f)
+
+    operation_var = tk.StringVar(value="AHP")
+    frame_ops = tk.Frame(root)
+    frame_ops.pack(pady=10)
+
+    operation_var = tk.StringVar(value="DEA")
+    frame_ops = tk.Frame(root)
+    frame_ops.pack(pady=10)
+
+    tk.Radiobutton(frame_ops, text="AHP计算", variable=operation_var, value="AHP").grid(row=0, column=0, padx=10)
+    tk.Radiobutton(frame_ops, text="DEA计算", variable=operation_var, value="DEA").grid(row=0, column=1, padx=10)
+
+    def on_process():
+        selection = listbox.curselection()
+        if not selection:
+            messagebox.showwarning("警告", "请先选择一个文件！")
+            return
+        selected_file = listbox.get(selection[0])
+        op = operation_var.get()
+        if op == "AHP":
+            process_ahp(selected_file)
+        else:
+            process_dea(selected_file)
+
+    tk.Button(root, text="执行所选操作", command=on_process).pack(pady=5)
+    tk.Button(root, text="退出", command=root.quit).pack(pady=5)
+
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
